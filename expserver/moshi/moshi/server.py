@@ -35,6 +35,7 @@ import time
 import secrets
 import sys
 from typing import Literal, Optional
+import json
 
 import aiohttp
 from aiohttp import web
@@ -96,7 +97,8 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False,
+                 enable_prefill_cache: bool = False):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -112,6 +114,22 @@ class ServerState:
         )
         
         self.lock = asyncio.Lock()
+
+        # Cache .pt voice prompt embeddings in RAM (and on the target device) to avoid
+        # repeated disk I/O and host->device transfers on every new connection.
+        # Maps absolute voice_prompt_path -> {"embeddings": Tensor, "cache": Tensor}
+        self._voice_prompt_pt_cache: dict[str, dict] = {}
+
+        # Cache tokenization of text prompts to avoid repeated sentencepiece work.
+        self._text_prompt_token_cache: dict[str, list[int]] = {}
+
+        # Optional: cache the *post-conditioning* LMGen streaming state for a given
+        # (voice_prompt, base_text_prompt). This can dramatically reduce per-call startup
+        # if you use a small set of base prompts and then inject per-customer details via kind=3.
+        # Key: f"{voice_prompt_path}|{wrapped_text_prompt}" -> {cache, provided, offset}
+        self._enable_prefill_cache = enable_prefill_cache
+        self._prefill_cache: dict[str, dict] = {}
+
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
@@ -163,12 +181,43 @@ class ServerState:
                 
         if self.lm_gen.voice_prompt != voice_prompt_path:
             if voice_prompt_path.endswith('.pt'):
-                # Load pre-saved voice prompt embeddings
-                self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+                # Load pre-saved voice prompt embeddings, cached in RAM/device for speed.
+                cached = self._voice_prompt_pt_cache.get(voice_prompt_path)
+                if cached is None:
+                    state = torch.load(voice_prompt_path)
+                    embeddings = state["embeddings"].to(self.lm_gen.lm_model.device)
+                    cache = state["cache"].to(self.lm_gen.lm_model.device)
+                    cached = {"embeddings": embeddings, "cache": cache}
+                    self._voice_prompt_pt_cache[voice_prompt_path] = cached
+
+                # Set directly (equivalent to LMGen.load_voice_prompt_embeddings but without disk I/O)
+                self.lm_gen.voice_prompt = voice_prompt_path
+                self.lm_gen.voice_prompt_audio = None
+                self.lm_gen.voice_prompt_embeddings = cached["embeddings"]
+                self.lm_gen.voice_prompt_cache = cached["cache"]
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
+
+        # Tokenize text prompt with a small cache.
+        qp = request.query["text_prompt"]
+        if len(qp) > 0:
+            wrapped = wrap_with_system_tags(qp)
+            toks = self._text_prompt_token_cache.get(wrapped)
+            if toks is None:
+                toks = self.text_tokenizer.encode(wrapped)
+                self._text_prompt_token_cache[wrapped] = toks
+            self.lm_gen.text_prompt_tokens = toks
+        else:
+            self.lm_gen.text_prompt_tokens = None
         seed = int(request["seed"]) if "seed" in request.query else None
+
+        # Per-request override to disable prefill cache if needed.
+        disable_prefill_cache = request.query.get("disable_prefill_cache", "0") in ("1", "true", "True")
+
+        # kind=3 client->server injected events (text or JSON)
+        event_queue: asyncio.Queue[dict] = asyncio.Queue()
+        # serialize LMGen.step() usage across audio loop and event injection
+        gen_lock = asyncio.Lock()
 
         async def recv_loop():
             nonlocal close
@@ -195,6 +244,20 @@ class ServerState:
                     if kind == 1:  # audio
                         payload = message[1:]
                         opus_reader.append_bytes(payload)
+                    elif kind == 3:  # injected system/event text (utf-8 or json)
+                        payload = message[1:]
+                        if not payload:
+                            continue
+                        try:
+                            if payload[:1] == b"{" and payload[-1:] == b"}":
+                                evt = json.loads(payload.decode("utf-8"))
+                            else:
+                                evt = {"type": "system_event", "text": payload.decode("utf-8", errors="replace")}
+                            if not isinstance(evt, dict):
+                                raise ValueError("kind=3 must be text or a JSON object")
+                            await event_queue.put(evt)
+                        except Exception as e:
+                            clog.log("warning", f"failed to parse kind=3 event: {e}")
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
@@ -224,7 +287,8 @@ class ServerState:
                     codes = self.mimi.encode(chunk)
                     _ = self.other_mimi.encode(chunk)
                     for c in range(codes.shape[-1]):
-                        tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                        async with gen_lock:
+                            tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
@@ -240,6 +304,43 @@ class ServerState:
                             await ws.send_bytes(msg)
                         else:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+
+        async def event_loop():
+            """Consumes kind=3 events and injects them as *silent* system text.
+
+            This advances model state without emitting audio to the client.
+            """
+            while True:
+                if close:
+                    return
+                try:
+                    evt = await asyncio.wait_for(event_queue.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    continue
+
+                try:
+                    etype = str(evt.get("type", "system_event"))
+                    text = evt.get("text", "")
+                    if not isinstance(text, str) or not text.strip():
+                        continue
+
+                    wrapped = wrap_with_system_tags(text)
+                    tokens = self.text_tokenizer.encode(wrapped)
+
+                    async with gen_lock:
+                        # Reuse the same internal prompt stepping used at startup.
+                        self.lm_gen.text_prompt_tokens = tokens
+                        await self.lm_gen._step_text_prompt_async(is_alive=None)  # type: ignore[attr-defined]
+                        self.lm_gen.text_prompt_tokens = None
+
+                    # Server->client control/status message (kind=4)
+                    try:
+                        ack = {"type": "event_applied", "event_type": etype}
+                        await ws.send_bytes(b"\x04" + json.dumps(ack).encode("utf-8"))
+                    except Exception:
+                        pass
+                except Exception as e:
+                    clog.log("warning", f"event injection failed: {e}")
 
         async def send_loop():
             while True:
@@ -279,18 +380,68 @@ class ServerState:
                 except aiohttp.ClientConnectionError:
                     return False
                 return True
-            # Reuse mimi for encoding voice prompt and then reset it before conversation starts
-            await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+            # If enabled, attempt to restore a cached post-conditioning state.
+            used_prefill_cache = False
+            prefill_key = None
+            if self._enable_prefill_cache and not disable_prefill_cache:
+                try:
+                    # Only cache when we have a text prompt and a stable voice prompt path.
+                    if voice_prompt_path and self.lm_gen.text_prompt_tokens is not None:
+                        # Note: in this server we already wrapped text_prompt with <system> tags
+                        # before encoding; use the wrapped string as the cache key component.
+                        wrapped_for_key = wrap_with_system_tags(request.query.get("text_prompt", ""))
+                        prefill_key = f"{voice_prompt_path}|{wrapped_for_key}"
+                        snap = self._prefill_cache.get(prefill_key)
+                        if snap is not None:
+                            st = getattr(self.lm_gen, "_streaming_state", None)
+                            if st is not None:
+                                st.cache.copy_(snap["cache"])
+                                st.provided.copy_(snap["provided"])
+                                st.offset = int(snap["offset"])
+                                used_prefill_cache = True
+                except Exception as e:
+                    clog.log("warning", f"prefill cache restore failed: {e}")
+
+            # Otherwise, run full conditioning.
+            if not used_prefill_cache:
+                # Reuse mimi for encoding voice prompt and then reset it before conversation starts
+                await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+
+                # Save snapshot for future sessions (aggressive optimization)
+                if self._enable_prefill_cache and not disable_prefill_cache:
+                    try:
+                        if prefill_key is None and voice_prompt_path and self.lm_gen.text_prompt_tokens is not None:
+                            wrapped_for_key = wrap_with_system_tags(request.query.get("text_prompt", ""))
+                            prefill_key = f"{voice_prompt_path}|{wrapped_for_key}"
+                        if prefill_key is not None and prefill_key not in self._prefill_cache:
+                            st = getattr(self.lm_gen, "_streaming_state", None)
+                            if st is not None:
+                                self._prefill_cache[prefill_key] = {
+                                    "cache": st.cache.detach().clone(),
+                                    "provided": st.provided.detach().clone(),
+                                    "offset": int(st.offset),
+                                }
+                    except Exception as e:
+                        clog.log("warning", f"prefill cache save failed: {e}")
             self.mimi.reset_streaming()
             clog.log("info", "done with system prompts")
             # Send the handshake.
             if await is_alive():
                 await ws.send_bytes(b"\x00")
+                # Explicit readiness message so upstream telephony can wait until conditioning is done.
+                ready_msg = {
+                    "type": "ready",
+                    "voice_prompt": os.path.basename(voice_prompt_path) if voice_prompt_path else None,
+                    "has_text_prompt": bool(request.query.get("text_prompt", "")),
+                    "used_prefill_cache": used_prefill_cache,
+                }
+                await ws.send_bytes(b"\x04" + json.dumps(ready_msg).encode("utf-8"))
                 clog.log("info", "sent handshake bytes")
                 # Clean cancellation manager
                 tasks = [
                     asyncio.create_task(recv_loop()),
                     asyncio.create_task(opus_loop()),
+                    asyncio.create_task(event_loop()),
                     asyncio.create_task(send_loop()),
                 ]
 
@@ -374,6 +525,15 @@ def main():
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
     parser.add_argument(
+        "--enable-prefill-cache",
+        action="store_true",
+        help=(
+            "Cache post-conditioning streaming state for (voice_prompt, text_prompt). "
+            "This speeds up repeated sessions with the same base prompt + voice, when per-call details "
+            "are provided via kind=3 injections."
+        ),
+    )
+    parser.add_argument(
         "--voice-prompt-dir",
         type=str,
         help=(
@@ -453,6 +613,7 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        enable_prefill_cache=args.enable_prefill_cache,
     )
     logger.info("warming up the model")
     state.warmup()
